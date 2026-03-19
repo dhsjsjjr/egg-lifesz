@@ -14,7 +14,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
       - name: Make gradlew executable
-        run: chmod +x egglife_rework/gradlew
+        run: find . -name "gradlew" -exec chmod +x {} \;
       - name: Build
         working-directory: egglife_rework
         run: ./gradlew build
