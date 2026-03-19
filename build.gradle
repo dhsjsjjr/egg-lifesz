@@ -1,0 +1,105 @@
+package com.egglife.manager;
+
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.minecraft.entity.effect.StatusEffectInstance;
+import net.minecraft.entity.effect.StatusEffects;
+import net.minecraft.entity.passive.RabbitEntity;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.registry.Registries;
+import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.text.Text;
+import net.minecraft.util.Formatting;
+import net.minecraft.util.Identifier;
+
+import java.util.*;
+
+public class BasketManager {
+    // Tracks when bunny hide ends per player
+    private static final Map<UUID, Long> hideEndTimes = new HashMap<>();
+    private static final Map<UUID, Long> hideCooldowns = new HashMap<>();
+    private static final long HIDE_DURATION_MS = 60_000L;
+    private static final long COOLDOWN_MS = 5 * 60_000L;
+
+    public static void register() {
+        ServerTickEvents.END_SERVER_TICK.register(server -> {
+            if (server.getTicks() % 20 != 0) return;
+            ServerWorld world = server.getOverworld();
+            long now = System.currentTimeMillis();
+            hideEndTimes.entrySet().removeIf(e -> {
+                if (now >= e.getValue()) {
+                    ServerPlayerEntity p = server.getPlayerManager().getPlayer(e.getKey());
+                    if (p != null) {
+                        // Reveal bunny again
+                        world.getEntitiesByClass(RabbitEntity.class, p.getBoundingBox().expand(2000),
+                            r -> {
+                                NbtCompound nbt = new NbtCompound();
+                                r.writeNbt(nbt);
+                                return nbt.contains("EggLifeOwner") && nbt.getString("EggLifeOwner").equals(p.getUuidAsString());
+                            }).forEach(r -> {
+                                r.setInvisible(false);
+                                r.setAiDisabled(false);
+                            });
+                        p.sendMessage(Text.literal("🐇 Your bunny is visible again!").formatted(Formatting.AQUA), true);
+                    }
+                    return true;
+                }
+                return false;
+            });
+
+            // Auto-collect eggs near players who have basket
+            for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+                if (!hasBasket(player)) continue;
+                // Check for Easter's Delight eggs nearby
+                world.getEntitiesByClass(net.minecraft.entity.ItemEntity.class,
+                    player.getBoundingBox().expand(1.5), ie -> {
+                        String id = Registries.ITEM.getId(ie.getStack().getItem()).toString();
+                        return id.startsWith("eastersdelight:") || id.equals("minecraft:egg");
+                    }).forEach(ie -> {
+                        ItemStack stack = ie.getStack().copy();
+                        if (player.getInventory().insertStack(stack)) {
+                            ie.discard();
+                            player.sendMessage(Text.literal("🧺 Picked up " + stack.getName().getString()).formatted(Formatting.LIGHT_PURPLE), true);
+                        }
+                    });
+            }
+        });
+    }
+
+    public static void tryHideBunny(ServerPlayerEntity player) {
+        long now = System.currentTimeMillis();
+        if (hideCooldowns.containsKey(player.getUuid()) && now - hideCooldowns.get(player.getUuid()) < COOLDOWN_MS) {
+            long remaining = (COOLDOWN_MS - (now - hideCooldowns.get(player.getUuid()))) / 1000;
+            player.sendMessage(Text.literal("🧺 Basket cooldown: " + remaining + "s").formatted(Formatting.YELLOW), true);
+            return;
+        }
+        ServerWorld world = (ServerWorld) player.getWorld();
+        world.getEntitiesByClass(RabbitEntity.class, player.getBoundingBox().expand(2000),
+            r -> {
+                NbtCompound nbt = new NbtCompound();
+                r.writeNbt(nbt);
+                return nbt.contains("EggLifeOwner") && nbt.getString("EggLifeOwner").equals(player.getUuidAsString());
+            }).stream().findFirst().ifPresentOrElse(bunny -> {
+                bunny.setInvisible(true);
+                bunny.setAiDisabled(true);
+                hideEndTimes.put(player.getUuid(), now + HIDE_DURATION_MS);
+                hideCooldowns.put(player.getUuid(), now);
+                // Give player Speed for 10 seconds
+                player.addStatusEffect(new StatusEffectInstance(StatusEffects.SPEED, 200, 1, false, true));
+                player.sendMessage(Text.literal("🧺 Bunny hidden for 60s! Speed boost activated!").formatted(Formatting.GREEN), false);
+            }, () -> player.sendMessage(Text.literal("🧺 Your bunny isn't nearby!").formatted(Formatting.RED), false));
+    }
+
+    private static boolean hasBasket(ServerPlayerEntity player) {
+        for (int i = 0; i < player.getInventory().size(); i++) {
+            ItemStack stack = player.getInventory().getStack(i);
+            if (!stack.isEmpty() && Registries.ITEM.getId(stack.getItem()).toString().equals("egglife:easter_basket")) {
+                return true;
+            }
+        }
+        return false;
+    }
+}

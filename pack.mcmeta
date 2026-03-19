@@ -1,0 +1,80 @@
+package com.egglife.manager;
+
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.minecraft.entity.ItemEntity;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.network.packet.s2c.play.SubtitleS2CPacket;
+import net.minecraft.network.packet.s2c.play.TitleS2CPacket;
+import net.minecraft.registry.Registries;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.text.Text;
+import net.minecraft.util.Formatting;
+import net.minecraft.util.Identifier;
+import net.minecraft.world.Heightmap;
+import java.util.*;
+
+public class EggRainManager {
+    private static final Random rand = new Random();
+    private static int ticksUntilRain = -1;
+    private static boolean active = false;
+
+    public static void register() {
+        ServerTickEvents.END_SERVER_TICK.register(server -> {
+            if (!active || !BunnyManager.isGameActive()) return;
+            if (ticksUntilRain < 0) ticksUntilRain = nextInterval();
+            if (--ticksUntilRain <= 0) {
+                triggerEggRain(server);
+                ticksUntilRain = nextInterval();
+            }
+        });
+    }
+
+    private static void triggerEggRain(MinecraftServer server) {
+        ServerWorld world = server.getOverworld();
+
+        // Title announcement
+        server.getPlayerManager().getPlayerList().forEach(p -> {
+            p.networkHandler.sendPacket(new TitleS2CPacket(
+                Text.literal("🥚 Easter Egg Rain!").formatted(Formatting.LIGHT_PURPLE, Formatting.BOLD)));
+            p.networkHandler.sendPacket(new SubtitleS2CPacket(
+                Text.literal("Eggs are falling from the sky!").formatted(Formatting.YELLOW)));
+        });
+
+        // Scatter eggs — very sparse (5-12 total, very rare)
+        int count = 5 + rand.nextInt(8);
+        for (int i = 0; i < count; i++) {
+            int x = rand.nextInt(480) - 240;
+            int z = rand.nextInt(480) - 240;
+            int y = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, x, z) + 30;
+            ItemStack egg = randomEgg();
+            ItemEntity entity = new ItemEntity(world, x, y, z, egg);
+            // Give it velocity so it falls naturally
+            entity.setVelocity(0, -0.5, 0);
+            entity.setPickupDelay(40);
+            world.spawnEntity(entity);
+        }
+    }
+
+    private static ItemStack randomEgg() {
+        // 70% chocolate egg (common), 30% dyed egg (rare)
+        boolean dyed = rand.nextInt(100) < 30;
+        String id = dyed ? "eastersdelight:dyed_egg" : "eastersdelight:chocolate_egg";
+        Item item = Registries.ITEM.get(new Identifier(id));
+        if (item == Items.AIR) item = Items.EGG; // fallback
+        return new ItemStack(item);
+    }
+
+    private static int nextInterval() {
+        // 15-30 minutes in ticks
+        return (15 * 60 + rand.nextInt(15 * 60)) * 20;
+    }
+
+    public static void setActive(boolean val) {
+        active = val;
+        if (val) ticksUntilRain = nextInterval();
+    }
+}

@@ -1,0 +1,187 @@
+package com.egglife.manager;
+
+import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.minecraft.entity.EntityType;
+import net.minecraft.entity.LightningEntity;
+import net.minecraft.entity.passive.RabbitEntity;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.network.packet.s2c.play.SubtitleS2CPacket;
+import net.minecraft.network.packet.s2c.play.TitleS2CPacket;
+import net.minecraft.particle.ParticleTypes;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.sound.SoundCategory;
+import net.minecraft.sound.SoundEvents;
+import net.minecraft.text.Text;
+import net.minecraft.util.Formatting;
+import net.minecraft.util.Identifier;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.GameMode;
+import net.minecraft.world.Heightmap;
+import java.util.*;
+
+public class BunnyManager {
+    private static final Map<UUID, UUID> playerToBunny = new HashMap<>();
+    private static final Map<UUID, UUID> bunnyToPlayer = new HashMap<>();
+    private static final Set<UUID> foundBunnies = new HashSet<>();
+    private static boolean gameActive = false;
+    private static boolean allFound = false;
+
+    public static void register() {
+        ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, amount) -> {
+            if (!gameActive) return true;
+            if (entity instanceof RabbitEntity rabbit) {
+                NbtCompound nbt = new NbtCompound();
+                rabbit.writeNbt(nbt);
+                if (nbt.contains("EggLifeOwner")) {
+                    UUID ownerUUID = UUID.fromString(nbt.getString("EggLifeOwner"));
+                    MinecraftServer server = rabbit.getServer();
+                    if (server != null) {
+                        ServerPlayerEntity player = server.getPlayerManager().getPlayer(ownerUUID);
+                        if (player != null) player.damage(source, amount);
+                    }
+                }
+            }
+            return true;
+        });
+
+        ServerLivingEntityEvents.AFTER_DEATH.register((entity, source) -> {
+            if (!gameActive) return;
+            if (entity instanceof RabbitEntity rabbit) {
+                NbtCompound nbt = new NbtCompound();
+                rabbit.writeNbt(nbt);
+                if (nbt.contains("EggLifeOwner")) {
+                    UUID ownerUUID = UUID.fromString(nbt.getString("EggLifeOwner"));
+                    bunnyToPlayer.remove(rabbit.getUuid());
+                    playerToBunny.remove(ownerUUID);
+                    foundBunnies.remove(ownerUUID);
+                    if (rabbit.getServer() != null) {
+                        ServerPlayerEntity player = rabbit.getServer().getPlayerManager().getPlayer(ownerUUID);
+                        if (player != null) {
+                            rabbit.getServer().getPlayerManager().broadcast(
+                                Text.literal("🐇 " + player.getName().getString() + "'s bunny was killed! They lose a life!").formatted(Formatting.RED), false);
+                            triggerDeath(player, rabbit.getServer());
+                        }
+                    }
+                }
+            }
+            if (entity instanceof ServerPlayerEntity player) {
+                UUID bunnyUUID = playerToBunny.remove(player.getUuid());
+                foundBunnies.remove(player.getUuid());
+                if (bunnyUUID != null) {
+                    ServerWorld world = player.getServer().getOverworld();
+                    world.getEntitiesByClass(RabbitEntity.class, player.getBoundingBox().expand(2000),
+                        r -> r.getUuid().equals(bunnyUUID)).forEach(r -> {
+                            spawnParticles(world, r.getX(), r.getY(), r.getZ());
+                            r.kill();
+                        });
+                    bunnyToPlayer.remove(bunnyUUID);
+                }
+            }
+        });
+
+        ServerTickEvents.END_SERVER_TICK.register(server -> {
+            if (!gameActive || server.getTicks() % 20 != 0) return;
+            ServerWorld world = server.getOverworld();
+            for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+                if (playerToBunny.containsKey(player.getUuid())) continue;
+                world.getEntitiesByClass(RabbitEntity.class, player.getBoundingBox().expand(6),
+                    r -> {
+                        NbtCompound nbt = new NbtCompound();
+                        r.writeNbt(nbt);
+                        return nbt.contains("EggLifeOwner") && nbt.getString("EggLifeOwner").equals(player.getUuidAsString());
+                    }
+                ).stream().findFirst().ifPresent(bunny -> {
+                    bunny.setOwner(player);
+                    bunny.setTamed(true);
+                    bunny.setCustomName(Text.literal("🐇 " + player.getName().getString()).formatted(Formatting.AQUA));
+                    bunny.setCustomNameVisible(true);
+                    playerToBunny.put(player.getUuid(), bunny.getUuid());
+                    bunnyToPlayer.put(bunny.getUuid(), player.getUuid());
+                    foundBunnies.add(player.getUuid());
+                    player.sendMessage(Text.literal("🐇 You found your bunny! It will follow only you. Keep it safe!").formatted(Formatting.GREEN), false);
+                    checkAllFound(server);
+                });
+            }
+        });
+    }
+
+    private static void checkAllFound(MinecraftServer server) {
+        if (allFound) return;
+        boolean everyone = server.getPlayerManager().getPlayerList().stream()
+            .allMatch(p -> foundBunnies.contains(p.getUuid()));
+        if (everyone) {
+            allFound = true;
+            server.getPlayerManager().broadcast(
+                Text.literal("🐇 Everyone found their bunny! Let the games begin!").formatted(Formatting.LIGHT_PURPLE, Formatting.BOLD), false);
+            server.getPlayerManager().getPlayerList().forEach(p -> {
+                p.networkHandler.sendPacket(new TitleS2CPacket(
+                    Text.literal("All Bunnies Found!").formatted(Formatting.GREEN, Formatting.BOLD)));
+                p.networkHandler.sendPacket(new SubtitleS2CPacket(
+                    Text.literal("Let the games begin!").formatted(Formatting.YELLOW)));
+                p.stopListeningToSound();
+            });
+        }
+    }
+
+    public static void startGame(MinecraftServer server) {
+        gameActive = true;
+        allFound = false;
+        playerToBunny.clear();
+        bunnyToPlayer.clear();
+        foundBunnies.clear();
+        ServerWorld world = server.getOverworld();
+        for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+            spawnBunny(player, world);
+        }
+        server.getPlayerManager().getPlayerList().forEach(p -> {
+            p.networkHandler.sendPacket(new TitleS2CPacket(
+                Text.literal("FIND YOUR BUNNY!").formatted(Formatting.YELLOW, Formatting.BOLD)));
+            p.networkHandler.sendPacket(new SubtitleS2CPacket(
+                Text.literal("Your bunny is somewhere out there...").formatted(Formatting.WHITE)));
+            p.playSound(new Identifier("egglife", "bunny_hunt"), SoundCategory.MUSIC, 1.0f, 1.0f);
+        });
+    }
+
+    public static void spawnBunny(ServerPlayerEntity player, ServerWorld world) {
+        Random rand = new Random();
+        int x = rand.nextInt(480) - 240;
+        int z = rand.nextInt(480) - 240;
+        int y = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, x, z);
+        RabbitEntity bunny = new RabbitEntity(EntityType.RABBIT, world);
+        bunny.refreshPositionAndAngles(x, y, z, 0, 0);
+        NbtCompound nbt = new NbtCompound();
+        bunny.writeNbt(nbt);
+        nbt.putString("EggLifeOwner", player.getUuidAsString());
+        bunny.readNbt(nbt);
+        world.spawnEntity(bunny);
+    }
+
+    public static void triggerDeath(ServerPlayerEntity player, MinecraftServer server) {
+        ServerWorld world = server.getOverworld();
+        double x = player.getX(), y = player.getY(), z = player.getZ();
+        spawnParticles(world, x, y, z);
+        world.playSound(null, BlockPos.ofFloored(x, y, z), SoundEvents.ENTITY_WITHER_SPAWN, SoundCategory.MASTER, 1f, 1f);
+        LightningEntity bolt = new LightningEntity(EntityType.LIGHTNING_BOLT, world);
+        bolt.refreshPositionAndAngles(x, y, z, 0, 0);
+        bolt.setCosmetic(true);
+        world.spawnEntity(bolt);
+        server.getPlayerManager().getPlayerList().forEach(p -> {
+            p.networkHandler.sendPacket(new TitleS2CPacket(
+                Text.literal(player.getName().getString() + " HAS FALLEN").formatted(Formatting.DARK_RED, Formatting.BOLD)));
+            p.networkHandler.sendPacket(new SubtitleS2CPacket(
+                Text.literal("Their story is over.").formatted(Formatting.RED)));
+        });
+        player.changeGameMode(GameMode.SPECTATOR);
+    }
+
+    public static void spawnParticles(ServerWorld world, double x, double y, double z) {
+        world.spawnParticles(ParticleTypes.LARGE_SMOKE, x, y + 1, z, 50, 0.5, 0.5, 0.5, 0.1);
+        world.spawnParticles(ParticleTypes.ASH, x, y + 1, z, 80, 1.0, 1.0, 1.0, 0.1);
+    }
+
+    public static boolean isGameActive() { return gameActive; }
+    public static Map<UUID, UUID> getPlayerToBunny() { return playerToBunny; }
+}
